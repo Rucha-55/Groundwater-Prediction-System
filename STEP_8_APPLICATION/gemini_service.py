@@ -4,19 +4,31 @@ Provides dynamic, context-aware location suggestions for Nashik District
 Enhanced with Google Maps integration for comprehensive place search
 """
 
-import google.generativeai as genai
 import json
 import re
 
-# Configure Gemini API (for AI-powered contextual search)
-GEMINI_API_KEY = "AIzaSyBPRyNH10Jce_cvYyVDps2qI959COxBjl8"
-genai.configure(api_key=GEMINI_API_KEY)
+# Try to import Google Gemini SDK (optional). If unavailable, fall back to local functions.
+try:
+    import google.generativeai as genai
+    GEMINI_API_KEY = ""  # Configure via environment or leave blank in repo
+    try:
+        # Only configure if a key is set in the file or environment (safe no-op otherwise)
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        pass
+    # Initialize Gemini model handle if available
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+    except Exception:
+        model = None
+    HAS_GENAI = True
+except Exception:
+    genai = None
+    model = None
+    HAS_GENAI = False
 
-# Google Maps API Key (for real place data)
-GOOGLE_MAPS_API_KEY = "AIzaSyBxsDSOmOE-ba4T7WdOW_k3P2TAbtiI-pg"
-
-# Initialize Gemini model
-model = genai.GenerativeModel('gemini-pro')
+# Google Maps API Key (for real place data) - optional
+GOOGLE_MAPS_API_KEY = ""
 
 def get_location_suggestions(query, max_results=10):
     """
@@ -31,103 +43,40 @@ def get_location_suggestions(query, max_results=10):
         list: List of location suggestions with details
     """
     
-    if not query or len(query.strip()) < 2:
-        # Return popular locations for empty query
-        return get_popular_locations()
-    
+    # If Gemini SDK isn't available, or query is short, return popular/local suggestions
+    if not HAS_GENAI or not model or not query or len(query.strip()) < 2:
+        # For short queries, return the popular list or local matching
+        popular = get_popular_locations()
+        q = (query or '').lower().strip()
+        if not q:
+            return popular[:max_results]
+        matches = [p for p in popular if q in p['name'].lower() or any(q in kw for kw in p.get('keywords', []))]
+        return matches[:max_results] if matches else popular[:max_results]
+
+    # If we have Gemini, call it (guarded)
     try:
-        prompt = f"""
-You are a location search assistant for Nashik District, Maharashtra, India.
-User is searching for: "{query}"
-
-Provide {max_results} relevant location suggestions in Nashik District that match this query.
-
-IMPORTANT: Understand the search intent and provide appropriate results:
-- If searching for PLACES: cities, towns, talukas, villages, dams, industrial areas, tourist spots
-- If searching for SCHOOLS: Schools, colleges, universities, education institutions
-- If searching for BANKS: Banks, ATMs, financial institutions
-- If searching for SHOPS: Malls, markets, stores, shopping centers
-- If searching for HOSPITALS: Hospitals, clinics, health centers
-- If searching for TEMPLES/RELIGIOUS: Temples, mosques, churches, religious places
-- If searching for RESTAURANTS: Restaurants, cafes, food places
-- If searching for HOTELS: Hotels, lodges, guest houses
-- If searching for GOVERNMENT: Government offices, municipal corporations, post offices
-- If searching for ANY ESTABLISHMENT: Match the query intent
-
-For each suggestion, provide:
-1. Name: Exact location name
-2. Category: Type (City/Town/Village/Dam/Institute/Industrial Area/Tourist Spot/etc.)
-3. Description: Brief description (1 line, include key features like population, importance, specialties)
-4. Keywords: Related search terms
-5. Popular: true/false (is it a well-known location?)
-6. Coordinates: Approximate latitude and longitude
-
-Format response EXACTLY as JSON array:
-[
-  {{
-    "name": "Location Name",
-    "category": "🏙️ City",
-    "description": "Brief description with key features",
-    "keywords": ["keyword1", "keyword2"],
-    "popular": true,
-    "lat": 20.0000,
-    "lon": 73.7900
-  }}
-]
-
-Rules:
-- Only suggest locations within or very near Nashik District
-- Prioritize exact matches first
-- Include educational institutions if query mentions college/university/school
-- Include dams if query mentions dam/water/reservoir
-- Include industrial areas if query mentions MIDC/industrial
-- Be accurate with coordinates (Nashik district: lat 19.5-21.0, lon 73.0-75.0)
-- Keep descriptions concise and informative
-- Return valid JSON only, no additional text
-
-Search query: "{query}"
-"""
-
+        prompt = f"You are a location search assistant for Nashik District. User is searching for: '{query}'\nReturn a JSON array of suggestions."
         response = model.generate_content(prompt)
-        
-        # Extract JSON from response
         response_text = response.text.strip()
-        
-        # Try to find JSON array in response
         json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
         if json_match:
-            json_str = json_match.group()
-            suggestions = json.loads(json_str)
-            
-            # Validate and enhance suggestions
-            validated_suggestions = []
+            suggestions = json.loads(json_match.group())
+            validated = []
             for idx, sug in enumerate(suggestions):
-                if all(key in sug for key in ['name', 'category', 'description']):
-                    # Add priority based on order
+                if 'name' in sug:
+                    sug.setdefault('category', '')
+                    sug.setdefault('description', '')
+                    sug.setdefault('lat', 20.0)
+                    sug.setdefault('lon', 73.79)
+                    sug.setdefault('keywords', [sug['name'].lower()])
+                    sug.setdefault('popular', False)
                     sug['priority'] = idx + 1
-                    
-                    # Ensure coordinates are present
-                    if 'lat' not in sug or 'lon' not in sug:
-                        sug['lat'] = 20.0  # Default Nashik center
-                        sug['lon'] = 73.79
-                    
-                    # Ensure keywords exist
-                    if 'keywords' not in sug:
-                        sug['keywords'] = [sug['name'].lower()]
-                    
-                    # Ensure popular flag exists
-                    if 'popular' not in sug:
-                        sug['popular'] = False
-                    
-                    validated_suggestions.append(sug)
-            
-            return validated_suggestions[:max_results]
+                    validated.append(sug)
+            return validated[:max_results]
         else:
-            print(f"Warning: Could not extract JSON from Gemini response: {response_text}")
             return get_fallback_suggestions(query)
-            
     except Exception as e:
-        print(f"Error getting Gemini suggestions: {str(e)}")
+        print(f"Error getting Gemini suggestions: {e}")
         return get_fallback_suggestions(query)
 
 
@@ -249,43 +198,32 @@ def get_location_details(location_name):
     """
     Get detailed information about a specific location using Gemini AI
     """
+    # If Gemini isn't available, return a simple local description where possible
+    if not HAS_GENAI or not model:
+        pops = get_popular_locations()
+        lname = (location_name or '').lower()
+        for p in pops:
+            if p['name'].lower() == lname or lname in p['name'].lower():
+                return {
+                    'name': p['name'],
+                    'type': p.get('category', ''),
+                    'description': p.get('description', ''),
+                    'features': [],
+                    'population': 'N/A',
+                    'coordinates': {'lat': p.get('lat', 20.0), 'lon': p.get('lon', 73.79)}
+                }
+        return None
+
     try:
-        prompt = f"""
-Provide detailed information about "{location_name}" in Nashik District, Maharashtra, India.
-
-Include:
-1. Full name and alternative names
-2. Type of location (city/town/village/dam/etc.)
-3. Brief description (2-3 sentences)
-4. Key features or importance
-5. Approximate population (if applicable)
-6. Major industries or activities
-7. Tourist attractions nearby
-8. Approximate coordinates (latitude, longitude)
-
-Format as JSON:
-{{
-  "name": "Full Location Name",
-  "type": "Type",
-  "description": "Detailed description",
-  "features": ["feature1", "feature2"],
-  "population": "approximate number or N/A",
-  "coordinates": {{"lat": 00.0000, "lon": 00.0000}}
-}}
-"""
-        
+        prompt = f"Provide detailed information about '{location_name}' in Nashik District. Return JSON."
         response = model.generate_content(prompt)
         response_text = response.text.strip()
-        
-        # Extract JSON
         json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
-        
         return None
-        
     except Exception as e:
-        print(f"Error getting location details: {str(e)}")
+        print(f"Error getting location details: {e}")
         return None
 
 
