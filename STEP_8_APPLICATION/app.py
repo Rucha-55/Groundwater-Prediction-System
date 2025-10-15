@@ -1,4 +1,5 @@
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, render_template, jsonify, send_from_directory
+from werkzeug.exceptions import RequestEntityTooLarge
 import pandas as pd
 import numpy as np
 from xgboost import XGBRegressor
@@ -19,16 +20,40 @@ from google_maps_service import (
     autocomplete_places,
     get_popular_places_by_category
 )
+# AI recommender module (trainable, lightweight)
+import ai_recommender
+from select_borewell_sites import bbox_to_grid
+
+# RAG Chatbot module
+import rag_chatbot
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
+
+# Create uploads folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Return JSON on file-too-large (413)
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(e):
+    return jsonify({
+        'success': False,
+        'error': f'File too large. Max {app.config.get("MAX_CONTENT_LENGTH", 0) // (1024*1024)}MB allowed.'
+    }), 413
 
 # Update paths - models are now in STEP_6_TRAINED_MODELS/
 model_dir = os.path.join(os.path.dirname(__file__), '..', 'STEP_6_TRAINED_MODELS')
 model_path = os.path.join(model_dir, 'water_level_model2.pkl')
 scaler_path = os.path.join(model_dir, 'scaler2.pkl')
 
-model = joblib.load(model_path)
-scaler = joblib.load(scaler_path)
+try:
+    model = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+except Exception as e:
+    print(f"⚠️ Warning: Could not load water level model/scaler: {e}")
+    model = None
+    scaler = None
 
 # Load allowed Nashik locations - now in STEP_7_SUPPORTING_DATA/
 locations_csv = os.path.join(os.path.dirname(__file__), '..', 'STEP_7_SUPPORTING_DATA', 'locations_equal_final.csv')
@@ -205,6 +230,12 @@ def index():
 def predict():
     """AJAX endpoint for groundwater prediction - Returns JSON (No page refresh!)"""
     try:
+        # Ensure prediction model is available
+        if model is None or scaler is None:
+            return jsonify({
+                'success': False,
+                'error': 'Prediction model not loaded. Please train or provide the model files in STEP_6_TRAINED_MODELS.'
+            }), 503
         data = {
             'Latitude': float(request.form['latitude']),
             'Longitude': float(request.form['longitude']),
@@ -288,78 +319,33 @@ def get_boundary():
     try:
         data = request.get_json()
         location_name = data.get('location_name', '')
-        lat_pt = data.get('lat', None)
-        lon_pt = data.get('lon', None)
-
-        # If lat/lon provided, try reverse geocode to get enclosing administrative boundary first
-        if lat_pt is not None and lon_pt is not None:
-            try:
-                headers = {'User-Agent': 'GroundwaterPredictionApp/1.0'}
-                rev_url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={float(lat_pt)}&lon={float(lon_pt)}&zoom=10&addressdetails=1&polygon_geojson=1"
-                rev_resp = requests.get(rev_url, headers=headers, timeout=10)
-                if rev_resp.status_code == 200:
-                    rev_json = rev_resp.json()
-                    if rev_json and 'geojson' in rev_json:
-                        print(f"✅ Reverse geocode returned geojson for point {lat_pt},{lon_pt}")
-                        return jsonify({
-                            'success': True,
-                            'boundary': rev_json['geojson'],
-                            'center': {'lat': float(lat_pt), 'lon': float(lon_pt)},
-                            'display_name': rev_json.get('display_name', location_name)
-                        })
-                    # If reverse didn't return geojson, fall through to Overpass-by-point using the provided coords
-                    location_name = location_name or rev_json.get('display_name', location_name)
-                else:
-                    print(f"⚠️ Nominatim reverse failed: {rev_resp.status_code}")
-            except Exception as e:
-                print(f"❌ Reverse geocode error: {e}")
-
-        # If no name and no coords resolved, require a name
-        if not location_name and (lat_pt is None or lon_pt is None):
-            return jsonify({'success': False, 'error': 'Location name or lat/lon is required'})
         
-        # Try multiple Nominatim query variants (plain name, taluka/tehsil, village, town)
-        variants = [
-            f"{location_name}, Nashik, Maharashtra, India",
-            f"{location_name} taluka, Nashik, Maharashtra, India",
-            f"{location_name} tehsil, Nashik, Maharashtra, India",
-            f"{location_name} village, Nashik, Maharashtra, India",
-            f"{location_name} town, Nashik, Maharashtra, India",
-            f"{location_name} municipal council, Nashik, Maharashtra, India",
-        ]
-
+        if not location_name:
+            return jsonify({'success': False, 'error': 'Location name is required'})
+        
+        # First, try with detailed polygon
+        nominatim_url = f"https://nominatim.openstreetmap.org/search?format=json&q={location_name}, Nashik, Maharashtra, India&limit=3&polygon_geojson=1&polygon_threshold=0.005"
+        
         headers = {'User-Agent': 'GroundwaterPredictionApp/1.0'}
-        results = []
-        location = None
-
-        print(f"🔍 Searching for: {location_name} (trying variants)")
-        for q in variants:
-            try:
-                nominatim_url = f"https://nominatim.openstreetmap.org/search?format=json&q={q}&limit=5&polygon_geojson=1&polygon_threshold=0.005"
-                resp = requests.get(nominatim_url, headers=headers, timeout=10)
-                rjson = resp.json() if resp.status_code == 200 else []
-                if rjson:
-                    results = rjson
-                    print(f"  🔎 Variant matched: {q} -> {len(results)} results")
-                    # prefer a result that already contains geojson
-                    for res in results:
-                        if 'geojson' in res:
-                            location = res
-                            print(f"    ✅ Found geojson in variant result: {res.get('display_name')}")
-                            break
-                    if location:
-                        break
-                    # otherwise keep the first set of results and stop trying further variants
-                    break
-            except Exception as e:
-                print(f"  ⚠️ Nominatim variant error for '{q}': {e}")
-
+        response = requests.get(nominatim_url, headers=headers, timeout=10)
+        results = response.json()
+        
+        print(f"🔍 Searching for: {location_name}")
+        
         if not results:
             return jsonify({'success': False, 'error': 'Location not found'})
-
+        
+        # Try to find result with boundary
+        location = None
+        for result in results:
+            if 'geojson' in result:
+                location = result
+                print(f"✅ Found boundary in result: {result['display_name']}")
+                break
+        
         if not location:
             location = results[0]
-            print(f"⚠️ No geojson in results, using first: {location.get('display_name')}")
+            print(f"⚠️ No geojson in results, using first: {location['display_name']}")
         
         # Check if geojson boundary is available
         if 'geojson' in location:
@@ -371,28 +357,6 @@ def get_boundary():
                 'center': {'lat': float(location['lat']), 'lon': float(location['lon'])},
                 'display_name': location['display_name']
             })
-
-        # If nominatim returned a bounding box but no geojson, build a polygon from it
-        if 'boundingbox' in location and not location.get('geojson'):
-            try:
-                bbox = location['boundingbox']
-                # boundingbox format: [south, north, west, east] or [lat1, lat2, lon1, lon2]
-                # Nominatim returns [south, north, west, east] as strings
-                south = float(bbox[0])
-                north = float(bbox[1])
-                west = float(bbox[2])
-                east = float(bbox[3])
-                coords = [[west, south], [east, south], [east, north], [west, north], [west, south]]
-                print(f"ℹ️ Using boundingbox to build polygon for {location.get('display_name')}")
-                return jsonify({
-                    'success': True,
-                    'boundary': {'type': 'Polygon', 'coordinates': [coords]},
-                    'center': {'lat': float(location['lat']), 'lon': float(location['lon'])},
-                    'display_name': location.get('display_name', location_name),
-                    'message': 'Boundary built from Nominatim bounding box'
-                })
-            except Exception as e:
-                print(f"⚠️ Failed to build polygon from boundingbox: {e}")
         
         # If no geojson, try to get from Overpass API with better query
         osm_type = location.get('osm_type', '')
@@ -401,28 +365,17 @@ def get_boundary():
         print(f"🔄 Trying Overpass API for OSM {osm_type} {osm_id}")
         
         if osm_type and osm_id:
-            # First Overpass attempt: fetch element geometry by id
             try:
-                # Convert osm_type to Overpass element selector
-                # Use 'relation' keyword for relations so Overpass returns full admin boundaries
-                overpass_type = {'node': 'node', 'way': 'way', 'relation': 'relation'}.get(osm_type, 'way')
-
-                # Build Overpass query: fetch element and its geometry (for relations/ways)
-                if overpass_type == 'relation':
-                    overpass_query = f"""
-                    [out:json][timeout:60];
-                    relation({osm_id});
-                    map_to_area -> .a;
-                    (relation({osm_id});>;);
-                    out body geom;
-                    """
-                else:
-                    overpass_query = f"""
-                    [out:json][timeout:60];
-                    {overpass_type}({osm_id});
-                    (._;>;);
-                    out body geom;
-                    """
+                # Convert osm_type to Overpass format
+                overpass_type = {'node': 'node', 'way': 'way', 'relation': 'rel'}.get(osm_type, 'way')
+                
+                # Enhanced query for better boundary extraction
+                overpass_query = f"""
+                [out:json][timeout:25];
+                {overpass_type}({osm_id});
+                (._;>;);
+                out geom;
+                """
                 
                 overpass_url = "https://overpass-api.de/api/interpreter"
                 overpass_response = requests.post(overpass_url, data={'data': overpass_query}, timeout=20)
@@ -432,7 +385,7 @@ def get_boundary():
                     # Find the main element (relation or way)
                     main_element = None
                     for elem in overpass_data['elements']:
-                        if elem.get('type') == osm_type and elem.get('id') == osm_id:
+                        if elem['type'] == osm_type and elem['id'] == osm_id:
                             main_element = elem
                             break
                     
@@ -442,16 +395,16 @@ def get_boundary():
                     coordinates = []
                     
                     # For relations (admin boundaries)
-                    if main_element.get('type') == 'relation' and 'members' in main_element:
+                    if main_element['type'] == 'relation' and 'members' in main_element:
                         print(f"  Processing relation with {len(main_element['members'])} members")
                         # Get all outer way nodes
-                        outer_ways = [m for m in main_element['members'] if m.get('role') == 'outer' and m.get('type') == 'way']
+                        outer_ways = [m for m in main_element['members'] if m.get('role') == 'outer' and m['type'] == 'way']
                         
                         for way_ref in outer_ways:
-                            way_id = way_ref.get('ref')
+                            way_id = way_ref['ref']
                             # Find the way in elements
                             for elem in overpass_data['elements']:
-                                if elem.get('type') == 'way' and elem.get('id') == way_id and 'geometry' in elem:
+                                if elem['type'] == 'way' and elem['id'] == way_id and 'geometry' in elem:
                                     way_coords = [[node['lon'], node['lat']] for node in elem['geometry']]
                                     coordinates.extend(way_coords)
                                     break
@@ -472,72 +425,13 @@ def get_boundary():
                                 'type': 'Polygon',
                                 'coordinates': [coordinates]
                             },
-                            'center': {'lat': float(location.get('lat', 0)), 'lon': float(location.get('lon', 0))},
-                            'display_name': location.get('display_name', location_name)
+                            'center': {'lat': float(location['lat']), 'lon': float(location['lon'])},
+                            'display_name': location['display_name']
                         })
                     else:
                         print(f"⚠️ Not enough coordinates: {len(coordinates)}")
             except Exception as e:
                 print(f"❌ Overpass API error: {str(e)}")
-
-            # Second Overpass attempt: search for administrative boundary relations/ways near the center point
-            try:
-                lat_center = float(location.get('lat', 0))
-                lon_center = float(location.get('lon', 0))
-                if lat_center and lon_center:
-                    print(f"🔎 Overpass fallback by point near {lat_center},{lon_center}")
-                    radius = 20000
-                    overpass_query2 = f"""
-                    [out:json][timeout:120];
-                    (
-                      relation["boundary"="administrative"]["name"~"{location_name}",i]["admin_level"~"[4-8]"](around:{radius},{lat_center},{lon_center});
-                      relation["boundary"="administrative"]["name:en"~"{location_name}",i](around:{radius},{lat_center},{lon_center});
-                      relation["boundary"="administrative"]["name:mr"~"{location_name}",i](around:{radius},{lat_center},{lon_center});
-                      way["boundary"="administrative"]["name"~"{location_name}",i](around:{radius},{lat_center},{lon_center});
-                      way["boundary"="administrative"](around:{radius},{lat_center},{lon_center});
-                      relation["boundary"="administrative"](around:{radius},{lat_center},{lon_center});
-                    );
-                    out body geom;
-                    """
-                    overpass_response2 = requests.post(overpass_url, data={'data': overpass_query2}, timeout=25)
-                    overpass_data2 = overpass_response2.json()
-
-                    if 'elements' in overpass_data2 and len(overpass_data2['elements']) > 0:
-                        # Prefer elements that include geometry
-                        elem_with_geom = None
-                        for elem in overpass_data2['elements']:
-                            if 'geometry' in elem and isinstance(elem['geometry'], list) and len(elem['geometry']) >= 3:
-                                elem_with_geom = elem
-                                break
-
-                        # If no direct geometry, try to assemble from relation members
-                        if not elem_with_geom:
-                            for elem in overpass_data2['elements']:
-                                if elem.get('type') == 'relation' and 'members' in elem:
-                                    coords = []
-                                    for member in elem['members']:
-                                        if member.get('type') == 'way':
-                                            way_id = member.get('ref')
-                                            for candidate in overpass_data2['elements']:
-                                                if candidate.get('type') == 'way' and candidate.get('id') == way_id and 'geometry' in candidate:
-                                                    coords.extend([[n['lon'], n['lat']] for n in candidate['geometry']])
-                                    if coords and len(coords) >= 3:
-                                        elem_with_geom = {'type': 'relation', 'geometry': coords}
-                                        break
-
-                        if elem_with_geom and 'geometry' in elem_with_geom:
-                            coords = [[n['lon'], n['lat']] for n in elem_with_geom['geometry']]
-                            if coords[0] != coords[-1]:
-                                coords.append(coords[0])
-                            print(f"✅ Overpass-by-point built boundary with {len(coords)} points")
-                            return jsonify({
-                                'success': True,
-                                'boundary': {'type': 'Polygon', 'coordinates': [coords]},
-                                'center': {'lat': lat_center, 'lon': lon_center},
-                                'display_name': location.get('display_name', location_name)
-                            })
-            except Exception as e:
-                print(f"❌ Overpass-by-point error: {e}")
         
         # If no boundary data available, create approximate circular boundary
         print(f"⚠️ No boundary found, creating approximate circular boundary")
@@ -694,42 +588,97 @@ def predict_area():
         return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/local_places', methods=['GET'])
-def local_places():
-    """Return a lightweight list of local place names (from borewell DB) for client-side autocomplete"""
+@app.route('/ai_recommend', methods=['POST'])
+def ai_recommend():
+    """Return AI-ranked candidate borewell sites for a user-selected bbox.
+
+    Expects JSON: {"bbox": [min_lat, min_lon, max_lat, max_lon], "n": 5, "spacing_km": 1.0}
+    """
     try:
-        places = []
+        data = request.get_json()
+        bbox = data.get('bbox')
+        n = int(data.get('n', 5))
+        spacing_km = float(data.get('spacing_km', 1.0))
+
+        if not bbox or len(bbox) != 4:
+            return jsonify({'success': False, 'error': 'bbox must be [min_lat,min_lon,max_lat,max_lon]'}), 400
+
+        # Ensure model is loaded (train if missing)
+        model_bundle = ai_recommender.load_model()
+        if model_bundle is None:
+            try:
+                model_bundle = ai_recommender.train_and_save_model(borewells_df)
+            except Exception as e:
+                return jsonify({'success': False, 'error': f'Cannot train model: {e}'}), 500
+
+        # Generate candidate grid inside bbox
+        candidates = bbox_to_grid(tuple(bbox), spacing_km=spacing_km)
+
+        # Score candidates
+        scored = ai_recommender.score_candidates_with_model(candidates, model_bundle, borewells_df)
+
+        # Optional: attach PDF evidence via RAG (single concise summary per bbox)
+        evidence_text = None
+        try:
+            if getattr(rag_chatbot, 'conversational_chain_global', None) is not None:
+                q_bbox = f"Provide a brief 1-2 sentence summary of typical groundwater/borewell depths or water levels for this region in Nashik based on the uploaded PDF, focusing on drillable depth ranges and any cautions. BBox: {bbox}"
+                rag_resp = rag_chatbot.ask_question(q_bbox)
+                if rag_resp.get('success'):
+                    # keep summary short
+                    evidence_text = rag_resp.get('answer', None)
+        except Exception:
+            # RAG optional; ignore failures silently
+            evidence_text = None
+
+        # Return top-n with cleaned numeric types and enriched fields
+        topn = []
+        for s in scored[:n]:
+            topn.append({
+                'lat': float(s['lat']),
+                'lon': float(s['lon']),
+                'prob_success': float(s['prob_success']),
+                'score': float(s.get('score', s['prob_success'])),
+                'recommended_depth': float(s.get('recommended_depth', 0)),
+                'distances_to_others': s.get('distances_to_others', {}),
+                'meta': s['meta'],
+                'contributions': s['contributions'],
+                'nearest_existing_m': float(s.get('nearest_existing_m', float('inf'))),
+                'counts_within_500m': int(s.get('counts_within_500m', 0)),
+                'counts_within_1km': int(s.get('counts_within_1km', 0)),
+                'why_text': s.get('why_text', ''),
+                'factors': s.get('factors', []),
+                'evidence': evidence_text
+            })
+
+        # Find existing borewells within the bbox
+        existing_borewells = []
         if not borewells_df.empty:
+            min_lat, min_lon, max_lat, max_lon = bbox
             for idx, row in borewells_df.iterrows():
-                try:
-                    name = str(row.get('Location_Name', '')).strip()
-                    lat = float(row.get('Latitude', 0))
-                    lon = float(row.get('Longitude', 0))
-                    taluka = str(row.get('Taluka', '')) if 'Taluka' in row else ''
-                    district = str(row.get('District', '')) if 'District' in row else ''
-                    if name:
-                        places.append({
-                            'name': name,
-                            'lat': lat,
-                            'lon': lon,
-                            'taluka': taluka,
-                            'district': district
-                        })
-                except Exception:
-                    continue
+                bw_lat = float(row['Latitude'])
+                bw_lon = float(row['Longitude'])
+                
+                # Check if borewell is within bbox
+                if min_lat <= bw_lat <= max_lat and min_lon <= bw_lon <= max_lon:
+                    existing_borewells.append({
+                        'id': row['Borewell_ID'],
+                        'location': row['Location_Name'],
+                        'lat': float(bw_lat),
+                        'lon': float(bw_lon),
+                        'depth': float(row['Depth_m']),
+                        'yield': int(row['Yield_LPH']),
+                        'year': int(row['Construction_Year']),
+                        'quality': row['Water_Quality'],
+                        'status': row['Status']
+                    })
 
-        # Deduplicate by name (keep first)
-        seen = set()
-        dedup = []
-        for p in places:
-            key = p['name'].lower()
-            if key in seen: continue
-            seen.add(key)
-            dedup.append(p)
-
-        return jsonify({'success': True, 'places': dedup, 'count': len(dedup)})
+        return jsonify({
+            'success': True, 
+            'results': topn,
+            'existing_borewells': existing_borewells
+        })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e), 'places': []})
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/get_borewells', methods=['POST'])
 def get_borewells():
@@ -1108,6 +1057,115 @@ def maps_popular_category():
             'places': []
         })
 
+# ============================================
+# RAG CHATBOT ENDPOINTS
+# ============================================
+
+@app.route('/test_rag')
+def test_rag():
+    """Test page for RAG upload"""
+    return send_from_directory('.', 'test_rag_upload.html')
+
+@app.route('/upload_pdf', methods=['POST'])
+def upload_pdf():
+    """Upload and process PDF for RAG chatbot"""
+    try:
+        print("📄 PDF Upload request received")
+        
+        if 'pdf_file' not in request.files:
+            print("❌ No PDF file in request")
+            return jsonify({'success': False, 'error': 'No PDF file provided'})
+        
+        file = request.files['pdf_file']
+        print(f"📄 File received: {file.filename}")
+        
+        if file.filename == '':
+            print("❌ Empty filename")
+            return jsonify({'success': False, 'error': 'No file selected'})
+        
+        if not file.filename.endswith('.pdf'):
+            print(f"❌ Invalid file type: {file.filename}")
+            return jsonify({'success': False, 'error': 'Only PDF files are allowed'})
+        
+        session_id = request.form.get('session_id', 'default')
+        print(f"📄 Processing PDF for session: {session_id}")
+        
+        # Process PDF
+        result = rag_chatbot.upload_and_process_pdf(file, session_id)
+        print(f"✅ Processing result: {result}")
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        print(f"❌ Error in upload_pdf: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/ask_rag', methods=['POST'])
+def ask_rag():
+    """Ask question to RAG chatbot"""
+    try:
+        data = request.get_json()
+        question = data.get('question', '')
+        session_id = data.get('session_id', 'default')
+        
+        if not question:
+            return jsonify({'success': False, 'error': 'No question provided'})
+        
+        # Get answer from RAG
+        result = rag_chatbot.ask_question(question, session_id)
+        if not isinstance(result, dict):
+            return jsonify({'success': False, 'error': 'Unexpected RAG response'}), 500
+        return jsonify(result)
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': f'ask_rag failed: {str(e)}'})
+
+@app.route('/get_chat_history', methods=['POST'])
+def get_chat_history():
+    """Get chat history for a session"""
+    try:
+        data = request.get_json()
+        session_id = data.get('session_id', 'default')
+        
+        history = rag_chatbot.get_chat_history(session_id)
+        
+        return jsonify({
+            'success': True,
+            'history': history
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/clear_chat', methods=['POST'])
+def clear_chat():
+    """Clear chat history"""
+    try:
+        data = request.get_json()
+        session_id = data.get('session_id', 'default')
+        
+        result = rag_chatbot.clear_chat_history(session_id)
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/reset_rag', methods=['POST'])
+def reset_rag():
+    """Reset RAG system"""
+    try:
+        result = rag_chatbot.reset_system()
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Disable auto reloader to avoid restarts during long operations (e.g., first-time model load)
+    app.run(debug=True, use_reloader=False)

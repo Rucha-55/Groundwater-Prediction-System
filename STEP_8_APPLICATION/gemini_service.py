@@ -5,20 +5,24 @@ Enhanced with Google Maps integration for comprehensive place search
 """
 
 import json
+import os
 import re
 
 # Try to import Google Gemini SDK (optional). If unavailable, fall back to local functions.
 try:
     import google.generativeai as genai
-    GEMINI_API_KEY = ""  # Configure via environment or leave blank in repo
+    # Read API key from environment to avoid committing secrets in code
+    GEMINI_API_KEY = os.getenv("GENAI_API_KEY", "")
+    if GEMINI_API_KEY:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+        except Exception:
+            # configuration failed but SDK is still importable
+            pass
+
+    # Initialize Gemini model handle if available (guarded)
     try:
-        # Only configure if a key is set in the file or environment (safe no-op otherwise)
-        genai.configure(api_key=GEMINI_API_KEY)
-    except Exception:
-        pass
-    # Initialize Gemini model handle if available
-    try:
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
     except Exception:
         model = None
     HAS_GENAI = True
@@ -27,8 +31,9 @@ except Exception:
     model = None
     HAS_GENAI = False
 
-# Google Maps API Key (for real place data) - optional
-GOOGLE_MAPS_API_KEY = ""
+# Google Maps API Key (for real place data) - optional; read from env
+# Set GOOGLE_MAPS_API_KEY in your environment instead of hardcoding
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
 def get_location_suggestions(query, max_results=10):
     """
